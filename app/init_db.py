@@ -1,5 +1,5 @@
 from app.database import Base, engine
-from app import models  # noqa: F401
+import app.model  # noqa: F401
 
 
 def main() -> None:
