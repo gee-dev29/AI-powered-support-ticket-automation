@@ -1,0 +1,243 @@
+{
+  "name": "Support request notification outbox",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "2c9fb33b-2e50-4540-bafa-bfc3f2b5a88e",
+      "name": "Every minute",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH stale AS (\n  UPDATE notifications\n  SET status = CASE WHEN attempts >= 5 THEN 'failed' ELSE 'pending' END,\n      available_at = NOW() + INTERVAL '5 minutes',\n      locked_at = NULL,\n      last_error = 'Notification worker lease expired'\n  WHERE status = 'processing'\n    AND locked_at < NOW() - INTERVAL '10 minutes'\n  RETURNING id\n), claimed AS (\n  SELECT id\n  FROM notifications\n  WHERE status = 'pending'\n    AND available_at <= NOW()\n    AND attempts < 5\n  ORDER BY created_at\n  FOR UPDATE SKIP LOCKED\n  LIMIT 25\n)\nUPDATE notifications AS n\nSET status = 'processing', attempts = n.attempts + 1, locked_at = NOW()\nFROM claimed\nWHERE n.id = claimed.id\nRETURNING n.id AS notification_id, n.channel, n.destination,\n          n.payload->>'subject' AS subject, n.payload->>'message' AS message;",
+        "options": {}
+      },
+      "id": "9691fd2c-71d8-4704-98eb-551cb2157fb6",
+      "name": "Claim pending notifications",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [420, 300],
+      "notes": "Select the configured support PostgreSQL credential after importing."
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "slack",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "slack"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "email",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "email"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "4691e4f1-7c34-478d-9138-0d53c7cd021e",
+      "name": "Route by channel",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [640, 300]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channelId": "={{ $json.destination }}",
+        "text": "={{ $json.message }}",
+        "otherOptions": {}
+      },
+      "id": "5f4fbba8-7c92-4f5c-8bc8-57a98952b622",
+      "name": "Send Slack message",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [880, 180],
+      "onError": "continueErrorOutput",
+      "notes": "Select the Slack credential after importing."
+    },
+    {
+      "parameters": {
+        "fromEmail": "support@example.com",
+        "toEmail": "={{ $('Route by channel').item.json.destination }}",
+        "subject": "={{ $('Route by channel').item.json.subject }}",
+        "text": "={{ $('Route by channel').item.json.message }}",
+        "options": {}
+      },
+      "id": "b9fa7ac4-5572-4ccd-86bd-9a024f01ceab",
+      "name": "Send email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [880, 420],
+      "onError": "continueErrorOutput",
+      "notes": "Select the SMTP credential after importing."
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "4aeeb133-217c-4a70-8f52-88c44ccf47d8",
+      "name": "Check failed notifications",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [200, 760]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH claimed AS (\n  SELECT id\n  FROM notifications\n  WHERE status = 'failed' AND alerted_at IS NULL\n  ORDER BY created_at\n  FOR UPDATE SKIP LOCKED\n  LIMIT 25\n)\nUPDATE notifications AS n\nSET alerted_at = NOW()\nFROM claimed\nWHERE n.id = claimed.id\nRETURNING n.id AS notification_id, n.support_request_id AS request_id,\n          n.channel, n.destination, n.last_error, n.attempts;",
+        "options": {}
+      },
+      "id": "1b4014db-c836-4950-87ac-6a2e71cfa0bb",
+      "name": "Claim exhausted failures",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [420, 760],
+      "notes": "Select the configured support PostgreSQL credential after importing."
+    },
+    {
+      "parameters": {
+        "fromEmail": "support@example.com",
+        "toEmail": "support-ops@example.com",
+        "subject": "Support request notification delivery failed",
+        "text": "={{ \"Notification \" + $json.notification_id + \" for request \" + $json.request_id + \" failed after \" + $json.attempts + \" attempts. Channel: \" + $json.channel + \". Error: \" + $json.last_error }}",
+        "options": {}
+      },
+      "id": "8889bbae-7a65-4731-972e-2db4410c9fa9",
+      "name": "Alert support operations",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [680, 760],
+      "notes": "Set an operations recipient and select the SMTP credential after importing."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE notifications\nSET status = 'sent', sent_at = NOW(), locked_at = NULL, last_error = NULL\nWHERE id = $1::uuid;",
+        "options": {
+          "queryReplacement": "={{ $('Claim pending notifications').item.json.notification_id }}"
+        }
+      },
+      "id": "87a0c6d4-f1a7-46e0-9b2e-45e72187b215",
+      "name": "Mark sent",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [1120, 300],
+      "notes": "Select the configured support PostgreSQL credential after importing."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE notifications\nSET status = CASE WHEN attempts >= 5 THEN 'failed' ELSE 'pending' END,\n    available_at = NOW() + INTERVAL '5 minutes',\n    locked_at = NULL,\n    last_error = LEFT($2, 2000)\nWHERE id = $1::uuid;",
+        "options": {
+          "queryReplacement": "={{ [ $('Claim pending notifications').item.json.notification_id, $json.error?.message || 'Notification delivery failed' ] }}"
+        }
+      },
+      "id": "6532a40d-9cba-4912-98f8-bdc40f69ea41",
+      "name": "Record delivery failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [1120, 540],
+      "notes": "Select the configured support PostgreSQL credential after importing."
+    }
+  ],
+  "connections": {
+    "Every minute": {
+      "main": [[{ "node": "Claim pending notifications", "type": "main", "index": 0 }]]
+    },
+    "Check failed notifications": {
+      "main": [[{ "node": "Claim exhausted failures", "type": "main", "index": 0 }]]
+    },
+    "Claim exhausted failures": {
+      "main": [[{ "node": "Alert support operations", "type": "main", "index": 0 }]]
+    },
+    "Claim pending notifications": {
+      "main": [[{ "node": "Route by channel", "type": "main", "index": 0 }]]
+    },
+    "Route by channel": {
+      "main": [
+        [{ "node": "Send Slack message", "type": "main", "index": 0 }],
+        [{ "node": "Send email", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Slack message": {
+      "main": [
+        [{ "node": "Mark sent", "type": "main", "index": 0 }],
+        [{ "node": "Record delivery failure", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send email": {
+      "main": [
+        [{ "node": "Mark sent", "type": "main", "index": 0 }],
+        [{ "node": "Record delivery failure", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "b1a3d2eb-95fb-4643-a232-22c8eb8d9b19",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
