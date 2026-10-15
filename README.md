@@ -6,7 +6,6 @@ A small FastAPI + PostgreSQL support-intake foundation with deterministic triage
 
 - FastAPI validates and stores requests before any notification is attempted.
 - PostgreSQL is the source of truth for customers, support requests, departments, routes, audit events, and notification work.
-- SQLAlchemy models live as one class per module in `app/model/` (customer, department, routing rule, support request, notification, audit event, and request status).
 - A deterministic policy assigns only supported categories. Ambiguous or unclassified requests enter `needs_review`.
 - n8n polls and claims notification outbox rows, delivers them, and records retry/failure state.
 - An LLM is not part of this first runnable slice. If added, its structured classification should be validated and treated as a suggestion; the policy and database routing remain authoritative.

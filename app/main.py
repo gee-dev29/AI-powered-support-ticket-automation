@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.model import (
+from app.models import (
     AuditEvent,
     Customer,
     Department,
@@ -18,8 +18,8 @@ from app.model import (
     RequestStatus,
     RoutingRule,
     SupportRequest,
+    utc_now,
 )
-from app.model.common import utc_now
 from app.policy import classify_request
 from app.schemas import (
     DepartmentAssignment,

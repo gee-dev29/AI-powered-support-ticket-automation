@@ -4,7 +4,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
-from app.model.request_status import RequestStatus
+from app.models import RequestStatus
 
 
 class SupportRequestCreate(BaseModel):
