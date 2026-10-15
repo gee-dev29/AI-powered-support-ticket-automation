@@ -3,8 +3,8 @@ import os
 from sqlalchemy import select
 
 from app.database import Base, SessionLocal, engine
-from app import models  # noqa: F401
-from app.models import Department, RoutingRule
+import app.model  # noqa: F401
+from app.model import Department, RoutingRule
 
 
 DEPARTMENTS = {
