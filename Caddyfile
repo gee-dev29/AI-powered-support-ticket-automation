@@ -1,0 +1,19 @@
+{$DOMAIN:api.support.example.com} {
+    # Automatic Let's Encrypt / ZeroSSL TLS termination
+    encode gzip zstd
+
+    # Security Headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Content-Security-Policy "default-src 'none'; frame-ancestors 'none';"
+    }
+
+    # Reverse proxy to FastAPI application
+    reverse_proxy api:8000 {
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Real-IP {remote_host}
+    }
+}
