@@ -85,7 +85,7 @@ def test_valid_request_is_saved_and_routed_with_customer_ack(client, database):
     assert response.status_code == 201
     result = response.json()
     assert result["category"] == "billing"
-    assert result["priority"] == "normal"
+    assert result["priority"] == "urgent"
     assert result["status"] == "assigned"
     assert result["department"] == "Billing"
     assert result["handled"] is False
@@ -276,7 +276,7 @@ def test_llm_classification_success_path():
 
     mock_llm = LLMClassification(
         category="billing",
-        priority="normal",
+        priority="urgent",
         confidence=0.95,
         summary="Customer asking about payment method update",
         reasoning="Involves payment settings and cards",
@@ -287,7 +287,7 @@ def test_llm_classification_success_path():
         override_llm_result=mock_llm,
     )
     assert decision.category == "billing"
-    assert decision.priority == "normal"
+    assert decision.priority == "urgent"
     assert decision.needs_human_review is False
     assert decision.llm_used is True
     assert decision.summary == "Customer asking about payment method update"
@@ -341,7 +341,7 @@ def test_llm_failure_falls_back_to_keywords():
         use_llm=False,
     )
     assert decision.category == "billing"
-    assert decision.priority == "normal"
+    assert decision.priority == "urgent"
     assert decision.needs_human_review is False
     assert decision.llm_used is False
 
@@ -439,3 +439,121 @@ def test_unrouted_review_creates_fallback_triage_notification(client, database, 
         ).all()
         assert len(triage_notifications) == 1
         assert triage_notifications[0].destination == "emergency-triage@example.com"
+
+
+def test_verified_customer_can_read_own_ticket_but_not_others(client, database):
+    from app.auth import generate_customer_token
+
+    # Customer 1 submits ticket
+    r1 = client.post(
+        "/requests",
+        json=request_body(contact_email="alice@example.com", subject="Question from Alice"),
+        headers={"Idempotency-Key": "cust-alice-1"},
+    )
+    assert r1.status_code == 201
+    r1_id = r1.json()["id"]
+
+    # Customer 2 submits ticket
+    r2 = client.post(
+        "/requests",
+        json=request_body(contact_email="bob@example.com", subject="Question from Bob"),
+        headers={"Idempotency-Key": "cust-bob-1"},
+    )
+    assert r2.status_code == 201
+    r2_id = r2.json()["id"]
+
+    alice_token = generate_customer_token("alice@example.com")
+    bob_token = generate_customer_token("bob@example.com")
+
+    # 1. Unauthenticated reading is rejected (401)
+    unauth_resp = client.get(f"/requests/{r1_id}")
+    assert unauth_resp.status_code == 401
+
+    # 2. Alice can read her own ticket
+    alice_resp = client.get(
+        f"/requests/{r1_id}",
+        headers={"X-Customer-Token": alice_token},
+    )
+    assert alice_resp.status_code == 200
+    assert alice_resp.json()["id"] == r1_id
+
+    # 3. Alice CANNOT read Bob's ticket (403 Forbidden)
+    forbidden_resp = client.get(
+        f"/requests/{r2_id}",
+        headers={"X-Customer-Token": alice_token},
+    )
+    assert forbidden_resp.status_code == 403
+
+    # 4. Customer list only returns their own requests
+    list_alice = client.get(
+        "/requests",
+        headers={"X-Customer-Token": alice_token},
+    )
+    assert list_alice.status_code == 200
+    alice_items = list_alice.json()["items"]
+    assert len(alice_items) == 1
+    assert alice_items[0]["contact_email"] == "alice@example.com"
+
+
+def test_abuse_honeypot_rejects_automated_bots(client):
+    response = client.post(
+        "/requests",
+        json=request_body(website="http://spam-bot-link.ru"),
+        headers={"Idempotency-Key": "bot-submit-1"},
+    )
+    assert response.status_code == 400
+    assert "automated abuse" in response.json()["detail"].lower()
+
+
+def test_sanitizer_masks_sensitive_data_in_notifications(client, database):
+    # Customer provides a credit card and token in message
+    response = client.post(
+        "/requests",
+        json=request_body(
+            subject="Billing issue",
+            message="My credit card 4111 2222 3333 4444 was charged. Bearer secret_token_xyz was used.",
+        ),
+        headers={"Idempotency-Key": "sanitizer-test-1"},
+    )
+    assert response.status_code == 201
+    ticket_id = response.json()["id"]
+
+    with database() as db:
+        dept_notifs = db.scalars(
+            select(Notification).where(
+                Notification.support_request_id == ticket_id,
+                Notification.notification_type.in_(["department_assignment", "human_review", "unassigned_triage_alert"]),
+            )
+        ).all()
+        assert len(dept_notifs) >= 1
+        for n in dept_notifs:
+            msg = n.payload["message"]
+            assert "4111 2222 3333 4444" not in msg
+            assert "[REDACTED_CARD]" in msg
+            assert "Bearer secret_token_xyz" not in msg
+            assert "Bearer [REDACTED_TOKEN]" in msg
+
+
+def test_health_monitoring_probes(client):
+    # Liveness probe
+    live_resp = client.get("/health/live")
+    assert live_resp.status_code == 200
+    assert live_resp.json()["status"] == "alive"
+
+    # Readiness probe
+    ready_resp = client.get("/health/ready")
+    assert ready_resp.status_code == 200
+    assert ready_resp.json()["status"] == "ready"
+    assert ready_resp.json()["database"] == "connected"
+
+
+def test_money_requests_always_have_urgent_priority():
+    # Direct tests verifying organization priority rule that money requests are urgent
+    for phrase in [
+        ("Invoice query", "I have a question about the invoice."),
+        ("Refund please", "Please issue a refund for my payment."),
+        ("Subscription billing", "Why did my monthly subscription charge increase?"),
+        ("Overcharge dispute", "There is a dispute over the charged amount."),
+    ]:
+        decision = classify_request(phrase[0], phrase[1], use_llm=False)
+        assert decision.priority == "urgent", f"Failed for {phrase}"
