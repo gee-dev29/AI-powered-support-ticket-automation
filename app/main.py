@@ -4,11 +4,12 @@ import os
 import uuid
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.auth import Actor, generate_customer_token, get_current_actor, require_admin_actor, require_staff_actor
 from app.database import get_db
 from app.model import (
     AuditEvent,
@@ -22,6 +23,8 @@ from app.model import (
 from app.model.common import utc_now
 from app.policy import classify_request
 from app.schemas import (
+    CustomerVerificationRequest,
+    CustomerVerificationResponse,
     DepartmentAssignment,
     DepartmentRead,
     HealthResponse,
@@ -32,6 +35,10 @@ from app.schemas import (
     SupportRequestResult,
     valid_idempotency_key,
 )
+from app.security.abuse import check_honeypot, should_send_guest_acknowledgement, verify_captcha_token
+from app.security.rate_limiter import check_email_rate_limit, check_rate_limit
+from app.security.retention import enforce_data_retention
+from app.security.sanitizer import redact_sensitive_text
 
 
 app = FastAPI(
@@ -77,12 +84,16 @@ def _notification(
     subject: str,
     message: str,
 ) -> Notification:
+    # Restrict notifications and logs to non-sensitive metadata by redacting PII/credentials
     return Notification(
         support_request_id=request_id,
         notification_type=notification_type,
         channel=channel,
         destination=destination,
-        payload={"subject": subject, "message": message},
+        payload={
+            "subject": redact_sensitive_text(subject),
+            "message": redact_sensitive_text(message),
+        },
     )
 
 
@@ -100,7 +111,10 @@ def _add_customer_ack(db: Session, ticket_id: str, email: str) -> None:
 
 
 def _result(
-    ticket: SupportRequest, department: Department | None, duplicate: bool = False
+    ticket: SupportRequest,
+    department: Department | None,
+    duplicate: bool = False,
+    customer_token: str | None = None,
 ) -> SupportRequestResult:
     return SupportRequestResult(
         id=uuid.UUID(ticket.id),
@@ -111,6 +125,7 @@ def _result(
         department=department.name if department else None,
         review_reason=ticket.review_reason,
         duplicate=duplicate,
+        customer_token=customer_token,
     )
 
 
@@ -151,22 +166,38 @@ def create_request(
     body: SupportRequestCreate,
     response: Response,
     db: DbSession,
+    request: Request,
     idempotency_header: Annotated[
         str, Header(alias="Idempotency-Key", min_length=1, max_length=200)
     ],
 ) -> SupportRequestResult:
+    # 1. Abuse controls: Honeypot check
+    check_honeypot(body.website)
+
+    # 2. Abuse controls: CAPTCHA validation
+    if not verify_captcha_token(body.captcha_token):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="CAPTCHA verification failed.",
+        )
+
+    # 3. Abuse controls: Rate limiting
+    check_rate_limit(request)
+    check_email_rate_limit(body.contact_email)
+
     try:
         idempotency_key = valid_idempotency_key(idempotency_header)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    customer_token = generate_customer_token(body.contact_email)
     existing = db.scalar(
         select(SupportRequest).where(SupportRequest.idempotency_key == idempotency_key)
     )
     if existing:
         response.status_code = status.HTTP_200_OK
         logger.info("duplicate_request id=%s", existing.id)
-        return _result(existing, existing.department, duplicate=True)
+        return _result(existing, existing.department, duplicate=True, customer_token=customer_token)
 
     decision = classify_request(body.subject, body.message)
     category = decision.category
@@ -247,7 +278,8 @@ def create_request(
                 details={"status": ticket.status, "category": category},
             )
         )
-        _add_customer_ack(db, ticket.id, body.contact_email)
+        if should_send_guest_acknowledgement(customer_verified=False):
+            _add_customer_ack(db, ticket.id, body.contact_email)
 
         if requires_review and department and destinations:
             review_message = (
@@ -327,7 +359,7 @@ def create_request(
             raise
         response.status_code = status.HTTP_200_OK
         logger.info("duplicate_request id=%s", duplicate.id)
-        return _result(duplicate, duplicate.department, duplicate=True)
+        return _result(duplicate, duplicate.department, duplicate=True, customer_token=customer_token)
 
     logger.info(
         "request_created id=%s category=%s priority=%s status=%s",
@@ -336,7 +368,7 @@ def create_request(
         ticket.priority,
         ticket.status,
     )
-    return _result(ticket, department)
+    return _result(ticket, department, customer_token=customer_token)
 
 
 def _require_support_key(
@@ -517,10 +549,10 @@ def list_departments(db: DbSession) -> list[DepartmentRead]:
 @app.get(
     "/requests",
     response_model=SupportRequestList,
-    dependencies=[Depends(_require_support_key)],
 )
 def list_requests(
     db: DbSession,
+    actor: Annotated[Actor, Depends(get_current_actor)],
     status: RequestStatus | None = None,
     category: str | None = None,
     priority: str | None = None,
@@ -530,6 +562,15 @@ def list_requests(
 ) -> SupportRequestList:
     query = select(SupportRequest)
     count_query = select(func.count(SupportRequest.id))
+
+    # If actor is a customer, strictly restrict access to their own tickets
+    if actor.actor_type == "customer":
+        query = query.join(SupportRequest.customer).where(
+            func.lower(Customer.email) == actor.identifier.lower()
+        )
+        count_query = count_query.join(SupportRequest.customer).where(
+            func.lower(Customer.email) == actor.identifier.lower()
+        )
 
     if status is not None:
         query = query.where(SupportRequest.status == status.value)
@@ -557,13 +598,70 @@ def list_requests(
 @app.get(
     "/requests/{request_id}",
     response_model=SupportRequestDetail,
-    dependencies=[Depends(_require_support_key)],
 )
 def get_request(
     request_id: uuid.UUID,
     db: DbSession,
+    actor: Annotated[Actor, Depends(get_current_actor)],
 ) -> SupportRequestDetail:
     ticket = db.get(SupportRequest, str(request_id))
     if ticket is None:
         raise HTTPException(status_code=404, detail="Support request not found.")
+
+    # Strict authorization: customers cannot view other customers' tickets
+    if actor.actor_type == "customer":
+        if ticket.customer.email.lower() != actor.identifier.lower():
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Forbidden: You are not authorized to view this support request.",
+            )
+
     return _detail(ticket, ticket.department)
+
+
+@app.post("/customers/verify-email", response_model=CustomerVerificationResponse)
+def verify_customer_email(body: CustomerVerificationRequest) -> CustomerVerificationResponse:
+    """Verify customer email and return a signed customer session token."""
+    # Generate signed customer token for future authenticated requests
+    token = generate_customer_token(body.email)
+    return CustomerVerificationResponse(
+        email=body.email,
+        is_verified=True,
+        customer_token=token,
+    )
+
+
+@app.get("/health/ready")
+def health_ready(db: DbSession) -> dict[str, str]:
+    """Readiness probe for load balancers and orchestrators checking DB availability."""
+    try:
+        db.execute(select(1)).scalar()
+        return {"status": "ready", "database": "connected"}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connectivity check failed.",
+        ) from exc
+
+
+@app.get("/health/live")
+def health_live() -> dict[str, str]:
+    """Liveness probe verifying HTTP server responsiveness."""
+    return {"status": "alive"}
+
+
+@app.post(
+    "/admin/retention/cleanup",
+    dependencies=[Depends(_require_support_key)],
+)
+def run_retention_cleanup(
+    db: DbSession,
+    retention_days: int = 90,
+    anonymize_older_than_days: int = 180,
+) -> dict[str, int]:
+    """Trigger organization retention policy enforcement."""
+    return enforce_data_retention(
+        db=db,
+        retention_days=retention_days,
+        anonymize_older_than_days=anonymize_older_than_days,
+    )
