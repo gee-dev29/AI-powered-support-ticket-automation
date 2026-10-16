@@ -12,6 +12,10 @@ class SupportRequestCreate(BaseModel):
     contact_email: EmailStr
     subject: str = Field(min_length=3, max_length=200)
     message: str = Field(min_length=10, max_length=10_000)
+    # Abuse defense: hidden honeypot field. Legitimate users leave this empty.
+    website: str | None = Field(default=None, max_length=200, description="Honeypot field")
+    # Optional CAPTCHA token
+    captcha_token: str | None = Field(default=None, max_length=1000)
 
     @field_validator("contact_name", "subject", "message")
     @classmethod
@@ -36,6 +40,18 @@ class SupportRequestResult(BaseModel):
     department: str | None
     review_reason: str | None
     duplicate: bool = False
+    customer_token: str | None = None
+
+
+class CustomerVerificationRequest(BaseModel):
+    email: EmailStr
+    token: str
+
+
+class CustomerVerificationResponse(BaseModel):
+    email: str
+    is_verified: bool
+    customer_token: str
 
 
 class SupportRequestDetail(SupportRequestResult):
