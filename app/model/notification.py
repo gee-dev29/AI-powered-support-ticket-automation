@@ -4,7 +4,7 @@ from typing import Any
 
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-
+from app.model.support_request import SupportRequest
 from app.database import Base
 from app.model.common import utc_now
 
