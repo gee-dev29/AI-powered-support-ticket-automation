@@ -5,7 +5,7 @@ import uuid
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -23,9 +23,12 @@ from app.model.common import utc_now
 from app.policy import classify_request
 from app.schemas import (
     DepartmentAssignment,
+    DepartmentRead,
     HealthResponse,
     StatusUpdate,
     SupportRequestCreate,
+    SupportRequestDetail,
+    SupportRequestList,
     SupportRequestResult,
     valid_idempotency_key,
 )
@@ -108,6 +111,28 @@ def _result(
         department=department.name if department else None,
         review_reason=ticket.review_reason,
         duplicate=duplicate,
+    )
+
+
+def _detail(
+    ticket: SupportRequest, department: Department | None, duplicate: bool = False
+) -> SupportRequestDetail:
+    return SupportRequestDetail(
+        id=uuid.UUID(ticket.id),
+        category=ticket.category,
+        priority=ticket.priority,
+        status=RequestStatus(ticket.status),
+        handled=ticket.handled,
+        department=department.name if department else None,
+        review_reason=ticket.review_reason,
+        duplicate=duplicate,
+        subject=ticket.subject,
+        message=ticket.message,
+        created_at=ticket.created_at,
+        updated_at=ticket.updated_at,
+        resolved_at=ticket.resolved_at,
+        contact_name=ticket.customer.name,
+        contact_email=ticket.customer.email,
     )
 
 
@@ -239,6 +264,37 @@ def create_request(
                         channel,
                         destination,
                         f"Support request needs review: {ticket.id}",
+                        review_message,
+                    )
+                )
+        elif requires_review:
+            fallback_email = os.getenv("TRIAGE_EMAIL") or os.getenv("DEFAULT_ALERT_EMAIL")
+            fallback_slack = os.getenv("TRIAGE_SLACK_CHANNEL")
+            review_message = (
+                f"UNASSIGNED support request {ticket.id} requires human triage.\n"
+                f"Reason: {review_reason or 'no_active_department_route'}. "
+                f"Category: {category}. Priority: {decision.priority}.\n\n"
+                f"Subject: {ticket.subject}\nMessage: {ticket.message}"
+            )
+            if fallback_email:
+                db.add(
+                    _notification(
+                        ticket.id,
+                        "unassigned_triage_alert",
+                        "email",
+                        fallback_email,
+                        f"URGENT Triage Needed: {ticket.id}",
+                        review_message,
+                    )
+                )
+            if fallback_slack:
+                db.add(
+                    _notification(
+                        ticket.id,
+                        "unassigned_triage_alert",
+                        "slack",
+                        fallback_slack,
+                        f"URGENT Triage Needed: {ticket.id}",
                         review_message,
                     )
                 )
@@ -437,3 +493,77 @@ def assign_request(
         department.id,
     )
     return _result(ticket, department)
+
+
+@app.get(
+    "/departments",
+    response_model=list[DepartmentRead],
+    dependencies=[Depends(_require_support_key)],
+)
+def list_departments(db: DbSession) -> list[DepartmentRead]:
+    departments = db.scalars(select(Department).order_by(Department.name)).all()
+    return [
+        DepartmentRead(
+            id=uuid.UUID(dept.id),
+            name=dept.name,
+            notification_email=dept.notification_email,
+            slack_channel_id=dept.slack_channel_id,
+            is_active=dept.is_active,
+        )
+        for dept in departments
+    ]
+
+
+@app.get(
+    "/requests",
+    response_model=SupportRequestList,
+    dependencies=[Depends(_require_support_key)],
+)
+def list_requests(
+    db: DbSession,
+    status: RequestStatus | None = None,
+    category: str | None = None,
+    priority: str | None = None,
+    handled: bool | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> SupportRequestList:
+    query = select(SupportRequest)
+    count_query = select(func.count(SupportRequest.id))
+
+    if status is not None:
+        query = query.where(SupportRequest.status == status.value)
+        count_query = count_query.where(SupportRequest.status == status.value)
+    if category is not None:
+        query = query.where(SupportRequest.category == category)
+        count_query = count_query.where(SupportRequest.category == category)
+    if priority is not None:
+        query = query.where(SupportRequest.priority == priority)
+        count_query = count_query.where(SupportRequest.priority == priority)
+    if handled is not None:
+        query = query.where(SupportRequest.handled == handled)
+        count_query = count_query.where(SupportRequest.handled == handled)
+
+    total = db.scalar(count_query) or 0
+    requests = db.scalars(
+        query.order_by(SupportRequest.created_at.desc()).limit(limit).offset(offset)
+    ).all()
+    return SupportRequestList(
+        total=total,
+        items=[_detail(req, req.department) for req in requests],
+    )
+
+
+@app.get(
+    "/requests/{request_id}",
+    response_model=SupportRequestDetail,
+    dependencies=[Depends(_require_support_key)],
+)
+def get_request(
+    request_id: uuid.UUID,
+    db: DbSession,
+) -> SupportRequestDetail:
+    ticket = db.get(SupportRequest, str(request_id))
+    if ticket is None:
+        raise HTTPException(status_code=404, detail="Support request not found.")
+    return _detail(ticket, ticket.department)
