@@ -269,3 +269,173 @@ def test_support_agent_can_assign_a_review_request(client, database, monkeypatch
         assert ticket.review_reason is None
         assert db.scalar(select(func.count(AuditEvent.id))) == 2
         assert db.scalar(select(func.count(Notification.id))) == 6
+
+
+def test_llm_classification_success_path():
+    from app.llm import LLMClassification
+
+    mock_llm = LLMClassification(
+        category="billing",
+        priority="normal",
+        confidence=0.95,
+        summary="Customer asking about payment method update",
+        reasoning="Involves payment settings and cards",
+    )
+    decision = classify_request(
+        "Update card",
+        "How can I change my credit card details?",
+        override_llm_result=mock_llm,
+    )
+    assert decision.category == "billing"
+    assert decision.priority == "normal"
+    assert decision.needs_human_review is False
+    assert decision.llm_used is True
+    assert decision.summary == "Customer asking about payment method update"
+
+
+def test_llm_low_confidence_forces_review():
+    from app.llm import LLMClassification
+
+    mock_llm = LLMClassification(
+        category="technical",
+        priority="normal",
+        confidence=0.55,
+        summary="Ambiguous question",
+        reasoning="Unsure about intent",
+    )
+    decision = classify_request(
+        "Widget issue",
+        "Something feels weird with the system.",
+        override_llm_result=mock_llm,
+    )
+    assert decision.category == "technical"
+    assert decision.needs_human_review is True
+    assert decision.review_reason == "low_model_confidence"
+
+
+def test_deterministic_security_override_over_llm():
+    from app.llm import LLMClassification
+
+    # Even if LLM hallucinates category='account' and priority='normal'
+    mock_llm = LLMClassification(
+        category="account",
+        priority="normal",
+        confidence=0.99,
+        summary="User says account was compromised",
+        reasoning="User mentions credentials",
+    )
+    decision = classify_request(
+        "Emergency: account compromised",
+        "There is an unauthorized access and data breach on our system!",
+        override_llm_result=mock_llm,
+    )
+    assert decision.category == "security"
+    assert decision.priority == "urgent"
+
+
+def test_llm_failure_falls_back_to_keywords():
+    decision = classify_request(
+        "My invoice is incorrect",
+        "Please refund the incorrect charged amount.",
+        override_llm_result=None,
+        use_llm=False,
+    )
+    assert decision.category == "billing"
+    assert decision.priority == "normal"
+    assert decision.needs_human_review is False
+    assert decision.llm_used is False
+
+
+def test_list_departments(client, database, monkeypatch):
+    monkeypatch.setenv("SUPPORT_ADMIN_API_KEY", "test-secret")
+    response = client.get(
+        "/departments",
+        headers={"Authorization": "Bearer test-secret"},
+    )
+    assert response.status_code == 200
+    depts = response.json()
+    assert len(depts) >= 5
+    dept_names = [d["name"] for d in depts]
+    assert "Billing" in dept_names
+    assert "Technical Support" in dept_names
+
+
+def test_list_and_get_requests(client, database, monkeypatch):
+    monkeypatch.setenv("SUPPORT_ADMIN_API_KEY", "test-secret")
+
+    # Create two requests
+    r1 = client.post(
+        "/requests",
+        json=request_body(subject="Billing query 1"),
+        headers={"Idempotency-Key": "req-list-1"},
+    )
+    assert r1.status_code == 201
+    r1_id = r1.json()["id"]
+
+    r2 = client.post(
+        "/requests",
+        json=request_body(
+            subject="Security incident detected",
+            message="We detected a security incident and account compromised.",
+        ),
+        headers={"Idempotency-Key": "req-list-2"},
+    )
+    assert r2.status_code == 201
+
+    # List all requests
+    list_resp = client.get(
+        "/requests",
+        headers={"Authorization": "Bearer test-secret"},
+    )
+    assert list_resp.status_code == 200
+    data = list_resp.json()
+    assert data["total"] >= 2
+    assert len(data["items"]) >= 2
+
+    # Filter by priority
+    urgent_resp = client.get(
+        "/requests?priority=urgent",
+        headers={"Authorization": "Bearer test-secret"},
+    )
+    assert urgent_resp.status_code == 200
+    urgent_data = urgent_resp.json()
+    assert all(item["priority"] == "urgent" for item in urgent_data["items"])
+
+    # Get single request
+    detail_resp = client.get(
+        f"/requests/{r1_id}",
+        headers={"Authorization": "Bearer test-secret"},
+    )
+    assert detail_resp.status_code == 200
+    detail = detail_resp.json()
+    assert detail["id"] == r1_id
+    assert detail["subject"] == "Billing query 1"
+    assert detail["contact_email"] == "casey@example.com"
+
+
+def test_unrouted_review_creates_fallback_triage_notification(client, database, monkeypatch):
+    monkeypatch.setenv("TRIAGE_EMAIL", "emergency-triage@example.com")
+
+    # Deactivate all departments so routing fails completely
+    with database() as db:
+        for d in db.scalars(select(Department)).all():
+            d.is_active = False
+            d.notification_email = None
+            d.slack_channel_id = None
+        db.commit()
+
+    response = client.post(
+        "/requests",
+        json=request_body(subject="Completely unroutable request", message="Random gibberish text here."),
+        headers={"Idempotency-Key": "unrouted-test-1"},
+    )
+    assert response.status_code == 201
+    assert response.json()["status"] == "needs_review"
+    assert response.json()["department"] is None
+
+    with database() as db:
+        triage_notifications = db.scalars(
+            select(Notification).where(Notification.notification_type == "unassigned_triage_alert")
+        ).all()
+        assert len(triage_notifications) == 1
+        assert triage_notifications[0].destination == "emergency-triage@example.com"
