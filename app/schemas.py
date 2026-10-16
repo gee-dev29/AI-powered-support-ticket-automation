@@ -1,5 +1,5 @@
 import re
-from enum import Enum
+from datetime import datetime
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
@@ -38,12 +38,35 @@ class SupportRequestResult(BaseModel):
     duplicate: bool = False
 
 
+class SupportRequestDetail(SupportRequestResult):
+    subject: str
+    message: str
+    created_at: datetime
+    updated_at: datetime
+    resolved_at: datetime | None
+    contact_name: str
+    contact_email: str
+
+
+class SupportRequestList(BaseModel):
+    total: int
+    items: list[SupportRequestDetail]
+
+
 class StatusUpdate(BaseModel):
     status: RequestStatus
 
 
 class DepartmentAssignment(BaseModel):
     department_id: UUID
+
+
+class DepartmentRead(BaseModel):
+    id: UUID
+    name: str
+    notification_email: str | None
+    slack_channel_id: str | None
+    is_active: bool
 
 
 class HealthResponse(BaseModel):
