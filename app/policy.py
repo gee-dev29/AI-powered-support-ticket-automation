@@ -29,6 +29,27 @@ URGENT_TERMS = (
     "all users are affected",
 )
 
+# Organization-approved priority policy: financial/money-related requests receive urgent priority
+MONEY_TERMS = (
+    "invoice",
+    "billing",
+    "charged",
+    "charge",
+    "refund",
+    "payment",
+    "money",
+    "credit card",
+    "bank",
+    "wire",
+    "pricing",
+    "fee",
+    "dispute",
+    "transaction",
+    "subscription",
+    "cost",
+    "overcharge",
+)
+
 
 @dataclass(frozen=True)
 class TriageDecision:
@@ -54,8 +75,9 @@ def classify_request(
     """Triage incoming request using LLM structured output with deterministic guardrails.
 
     Policy:
-    1. Deterministic rules guard critical issues: explicit security keywords force
-       'security' category and 'urgent' priority.
+    1. Deterministic rules guard critical issues:
+       - Explicit security keywords force 'security' category and 'urgent' priority.
+       - Financial and money-related requests receive 'urgent' priority.
     2. An LLM performs structured classification if enabled and available.
     3. Low LLM confidence (<0.70) or 'general' categorization forces human review.
     4. Deterministic keyword heuristics serve as fallback if LLM is unavailable or fails.
@@ -65,6 +87,8 @@ def classify_request(
     has_security_breach_terms = any(
         _contains_term(text, term) for term in CATEGORY_TERMS["security"]
     )
+    has_money_terms = any(_contains_term(text, term) for term in MONEY_TERMS)
+    is_urgent_topic = deterministic_urgent or has_security_breach_terms or has_money_terms
 
     llm_result: LLMClassification | None = override_llm_result
     if llm_result is None and use_llm:
@@ -74,7 +98,11 @@ def classify_request(
         category = "security" if has_security_breach_terms else llm_result.category
         priority = (
             "urgent"
-            if (deterministic_urgent or llm_result.priority == "urgent" or category == "security")
+            if (
+                is_urgent_topic
+                or llm_result.priority == "urgent"
+                or category in ("security", "billing")
+            )
             else "normal"
         )
 
@@ -107,9 +135,11 @@ def classify_request(
         matches = ["security"]
 
     if len(matches) == 1:
+        cat = matches[0]
+        is_urgent = is_urgent_topic or cat in ("security", "billing")
         return TriageDecision(
-            category=matches[0],
-            priority="urgent" if (deterministic_urgent or matches[0] == "security") else "normal",
+            category=cat,
+            priority="urgent" if is_urgent else "normal",
             needs_human_review=False,
             review_reason=None,
             llm_used=False,
@@ -119,7 +149,7 @@ def classify_request(
     reason = "ambiguous_category" if len(matches) > 1 else "unclassified_request"
     return TriageDecision(
         category="general",
-        priority="urgent" if deterministic_urgent else "normal",
+        priority="urgent" if is_urgent_topic else "normal",
         needs_human_review=True,
         review_reason=reason,
         llm_used=False,
