@@ -1,10 +1,14 @@
 import uuid
 
+from typing import TYPE_CHECKING
+
 from sqlalchemy import Boolean, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
 
+if TYPE_CHECKING:
+    from app.model.department import Department
 
 class RoutingRule(Base):
     __tablename__ = "routing_rules"
